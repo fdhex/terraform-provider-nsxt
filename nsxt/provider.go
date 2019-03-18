@@ -4,10 +4,16 @@
 package nsxt
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/vmware/go-vmware-nsxt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
 )
 
 var defaultRetryOnStatusCodes = []int{429, 503}
@@ -84,6 +90,12 @@ func Provider() terraform.ResourceProvider {
 					Type: schema.TypeInt,
 				},
 				// There is no support for default values/func for list, so it will be handled later
+			},
+			"proxy": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "HTTP Proxy to access NSXT Host through",
+				DefaultFunc: schema.EnvDefaultFunc("NSXT_PROXY", nil),
 			},
 		},
 
@@ -211,6 +223,8 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 	retryMinDelay := d.Get("retry_min_delay").(int)
 	retryMaxDelay := d.Get("retry_max_delay").(int)
 
+	proxyEndpoint := d.Get("proxy").(string)
+
 	statuses := d.Get("retry_on_status_codes").([]interface{})
 	if len(statuses) == 0 {
 		// Set to the defaults if empty
@@ -245,6 +259,10 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 		RetriesConfiguration: retriesConfig,
 	}
 
+	if clientAuthCertFile != "" && clientAuthKeyFile != "" && caFile != "" && !insecure && proxyEndpoint != "" {
+		cfg.HTTPClient = getHTTPClient(clientAuthCertFile, clientAuthKeyFile, caFile, insecure, proxyEndpoint)
+	}
+
 	nsxClient, err := nsxt.NewAPIClient(&cfg)
 	if err != nil {
 		return nil, err
@@ -256,4 +274,58 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 	}
 
 	return nsxClient, nil
+}
+
+func getHTTPClient(clientAuthCertFile string, clientAuthKeyFile string, caFile string, insecure bool, proxyEndpoint string) *http.Client {
+
+	nsxClientCert, err := ioutil.ReadFile(clientAuthCertFile)
+	if err != nil {
+		return nil
+	}
+
+	nsxClientKey, err := ioutil.ReadFile(clientAuthKeyFile)
+	if err != nil {
+		return nil
+	}
+
+	nsxCa, err := ioutil.ReadFile(caFile)
+	if err != nil {
+		return nil
+	}
+
+	cert, err := tls.X509KeyPair([]byte(nsxClientCert),
+		[]byte(nsxClientKey))
+	if err != nil {
+		fmt.Printf("nsxt http client failed: %s\n", err)
+		os.Exit(1)
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM([]byte(nsxCa))
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: false,
+		RootCAs:            caCertPool,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return &cert, nil
+		},
+		//Certificates: []tls.Certificate{cert},
+	}
+
+	tlsConfig.BuildNameToCertificate()
+
+	proxy, err := url.Parse(proxyEndpoint)
+	if err != nil {
+		fmt.Printf("http client failed: %s\n", err)
+		os.Exit(1)
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig:     tlsConfig,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		Proxy:               http.ProxyURL(proxy),
+	}
+
+	return &http.Client{Transport: transport}
 }
